@@ -1144,6 +1144,71 @@ func TestArrayLabels(t *testing.T) {
 	}, modelpb.NumericLabels(spanEvent.NumericLabels))
 }
 
+// TestLabelsPrefixedAttributes confirms that an OTLP attribute whose key
+// already starts with "labels." or "numeric_labels." is treated like any other
+// unsupported attribute: replaceDots converts every "." to "_" before the key
+// is stored in event.Labels / event.NumericLabels.  That means "labels.foo"
+// produces label key "labels_foo", which is distinct from a plain "foo"
+// attribute that produces label key "foo".  The two never collide.
+func TestLabelsPrefixedAttributes(t *testing.T) {
+	attr := map[string]interface{}{
+		"foo":               "plain",
+		"labels.foo":        "prefixed",
+		"count":             int64(1),
+		"numeric_labels.x":  float64(2),
+	}
+
+	event := transformTransactionWithAttributes(t, attr)
+
+	assert.Equal(t, modelpb.Labels{
+		"foo":        {Value: "plain"},
+		"labels_foo": {Value: "prefixed"},
+	}, modelpb.Labels(event.Labels))
+	assert.Equal(t, modelpb.NumericLabels{
+		"count":            {Value: 1},
+		"numeric_labels_x": {Value: 2},
+	}, modelpb.NumericLabels(event.NumericLabels))
+
+	// Map-typed attributes have no case in setLabel and are silently dropped.
+	t.Run("map_typed_attribute_dropped", func(t *testing.T) {
+		attr := map[string]interface{}{
+			"nested.obj": map[string]interface{}{"key": "val"},
+			"plain":      "value",
+		}
+		ev := transformTransactionWithAttributes(t, attr)
+		assert.Equal(t, modelpb.Labels{"plain": {Value: "value"}}, modelpb.Labels(ev.Labels))
+		assert.Empty(t, ev.NumericLabels)
+	})
+
+	// Two attributes that reduce to the same key via replaceDots both call
+	// setLabel with that key; the second call overwrites the first (last writer wins).
+	t.Run("sanitized_key_collision_last_writer_wins", func(t *testing.T) {
+		traces, spans := newTracesSpans()
+		otelSpan := spans.Spans().AppendEmpty()
+		otelSpan.SetTraceID(pcommon.TraceID{1})
+		otelSpan.SetSpanID(pcommon.SpanID{2})
+		otelSpan.Attributes().PutStr("foo.bar", "first")
+		otelSpan.Attributes().PutStr("foo_bar", "second") // both → label key "foo_bar"
+		events := transformTraces(t, traces)
+		ev := (*events)[0]
+		assert.Equal(t, modelpb.Labels{"foo_bar": {Value: "second"}}, modelpb.Labels(ev.Labels))
+	})
+
+	// "labels.foo.bar" and "labels.foo_bar" both reduce to "labels_foo_bar"
+	// via replaceDots.  Last writer wins.
+	t.Run("labels_prefixed_key_collision_last_writer_wins", func(t *testing.T) {
+		traces, spans := newTracesSpans()
+		otelSpan := spans.Spans().AppendEmpty()
+		otelSpan.SetTraceID(pcommon.TraceID{1})
+		otelSpan.SetSpanID(pcommon.SpanID{2})
+		otelSpan.Attributes().PutStr("labels.foo.bar", "dotted")
+		otelSpan.Attributes().PutStr("labels.foo_bar", "plain") // both → "labels_foo_bar"
+		events := transformTraces(t, traces)
+		ev := (*events)[0]
+		assert.Equal(t, modelpb.Labels{"labels_foo_bar": {Value: "plain"}}, modelpb.Labels(ev.Labels))
+	})
+}
+
 func TestProfilerStackTraceIds(t *testing.T) {
 	validIds := []interface{}{"myId1", "myId2"}
 	badValueTypes := []interface{}{42, 68, "valid"}
